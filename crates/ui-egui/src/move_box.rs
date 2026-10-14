@@ -2,7 +2,7 @@
 //! that starts where no layer would be picked (an empty, transparent spot, or the pasteboard
 //! outside the canvas) draws a box instead of moving anything. Releasing selects every layer whose
 //! content touches the box (`layer.selectInRect`; Auto-Select: Group selects their outermost
-//! groups), ⇧ adds them to the layers already selected. A click there selects nothing.
+//! groups), ⇧ adds them to the layers already selected. A click there clears the layer selection.
 
 use serde_json::json;
 
@@ -16,12 +16,14 @@ pub(crate) struct LayerBox {
     end: [f64; 2],
     /// ⇧ at the press: add to the layer selection.
     add: bool,
+    /// ⌘/Ctrl at the press: select the layers inside groups, not the groups.
+    deep: bool,
 }
 
 /// A Move-tool press that Auto-Select found nothing under: start the marquee at `p`. The press
 /// started a Move gesture's snapping and ⇧/⌥ handling, which a marquee has none of.
-pub(crate) fn begin(app: &mut PhotocraftApp, p: [f64; 2], add: bool) {
-    app.layer_box = Some(LayerBox { start: p, end: p, add });
+pub(crate) fn begin(app: &mut PhotocraftApp, p: [f64; 2], add: bool, deep: bool) {
+    app.layer_box = Some(LayerBox { start: p, end: p, add, deep });
     app.prefs_rt.snap = None;
     app.prefs_rt.snap_lines.clear();
     app.move_mods = Default::default();
@@ -30,6 +32,20 @@ pub(crate) fn begin(app: &mut PhotocraftApp, p: [f64; 2], add: bool) {
 /// No visible layer has pixels at document point `p` (locked ones included).
 pub(crate) fn empty_at(app: &mut PhotocraftApp, p: [f64; 2]) -> bool {
     app.run("layer.pickAt", json!({"x": p[0], "y": p[1], "list": true})).is_ok_and(|v| v["layers"].as_array().is_some_and(Vec::is_empty))
+}
+
+/// A content layer (not the artboard frame, not the Background) has pixels at `p`. A click
+/// there keeps a selection; a click anywhere else clears it.
+pub(crate) fn element_under(app: &mut PhotocraftApp, p: [f64; 2]) -> bool {
+    let Ok(v) = app.run("layer.pickAt", json!({"x": p[0], "y": p[1], "list": true})) else { return false };
+    let Some(st) = app.session.active() else { return false };
+    v["layers"].as_array().is_some_and(|layers| {
+        layers.iter().any(|row| {
+            let Some(id) = row.get("layer").and_then(serde_json::Value::as_u64) else { return false };
+            let id = photocraft_doc::LayerId(id);
+            st.doc.layer(id).is_some_and(|l| l.artboard().is_none() && !st.doc.is_background(id))
+        })
+    })
 }
 
 /// The pointer moves or is released while a marquee is dragged (unsnapped, unconstrained): true
@@ -50,10 +66,16 @@ pub(crate) fn pointer(app: &mut PhotocraftApp, ev: ToolEvent) -> bool {
             let b = LayerBox { end: [x, y], ..*b };
             app.layer_box = None;
             let (w, h) = (b.end[0] - b.start[0], b.end[1] - b.start[1]);
-            if w == 0.0 || h == 0.0 {
+            // A click (a wobble of a few screen pixels included) clears the selection. ⇧ keeps it,
+            // matching a shift-drag that adds.
+            let zoom = f64::from(app.point_zoom().max(0.01));
+            if w.abs() * zoom < 3.0 && h.abs() * zoom < 3.0 {
+                if !b.add {
+                    let _ = app.run("select.deselectLayers", json!({}));
+                }
                 return true;
             }
-            let target = app.ui.tool_options.move_target.clone();
+            let target = if b.deep { "layer".to_string() } else { app.ui.tool_options.move_target.clone() };
             let mode = if b.add { "add" } else { "replace" };
             let p = json!({"x": b.start[0], "y": b.start[1], "width": w, "height": h, "target": target, "mode": mode});
             if let Err(e) = app.run("layer.selectInRect", p) {

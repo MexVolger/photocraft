@@ -187,6 +187,40 @@ fn new_layer_without_dialog(app: &mut PhotocraftApp, ctx: &egui::Context) -> boo
     true
 }
 
+/// ⇧1 fits the canvas and ⇧2 fits the selection. The physical digit is what counts, so a layout
+/// that types `!` for ⇧1 still fits. Only ⇧ is held; ⌘1 stays 100%.
+fn figma_view_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
+    let mut take = |digit: Key| {
+        ctx.input_mut(|i| {
+            let mut hit = false;
+            i.events.retain(|e| {
+                let egui::Event::Key { key, physical_key, pressed: true, modifiers, repeat, .. } = *e else { return true };
+                if repeat || modifiers.command || modifiers.ctrl || modifiers.alt || !modifiers.shift {
+                    return true;
+                }
+                if physical_key == Some(digit) || key == digit {
+                    hit = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            hit
+        })
+    };
+    let id = if take(Key::Num1) {
+        "view.fitOnScreen"
+    } else if take(Key::Num2) {
+        "view.fitLayersOnScreen"
+    } else {
+        return false;
+    };
+    if crate::menus::is_enabled(app, id) {
+        let _ = crate::menus::invoke(app, ctx, id, json!({}));
+    }
+    true
+}
+
 fn nav_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     for id in NAV_COMMANDS {
         let sc = crate::menus::UI_COMMANDS.iter().find(|c| c.0 == id).and_then(|c| parse(app.session.prefs().shortcut(id, c.3)?));
@@ -199,7 +233,7 @@ fn nav_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
             return true;
         }
     }
-    false
+    matches!(app.ui.tool, Tool::Move | Tool::Hand | Tool::Zoom) && figma_view_keys(app, ctx)
 }
 
 /// The key press a clipboard event stands for outside text fields, with `mods` held: Copy, Cut
@@ -630,6 +664,11 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
             crate::spring_tools::pressed(app, t.key(), before, plain, now);
             return;
         }
+    }
+    // Move, Hand and Zoom: ⇧1 fits the canvas and ⇧2 fits the selection (Figma). Painting tools
+    // keep ⇧1–0 as flow or fill.
+    if matches!(app.ui.tool, Tool::Move | Tool::Hand | Tool::Zoom) && figma_view_keys(app, ctx) {
+        return;
     }
     // 1–0 set opacity, ⇧1–0 flow or fill (`opacity_keys`).
     crate::opacity_keys::handle(app, ctx);

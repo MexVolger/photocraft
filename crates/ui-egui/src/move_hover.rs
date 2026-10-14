@@ -1,6 +1,7 @@
 //! Move tool › Show Highlight on Rollover (Preferences › Tools, on by default): with Auto-Select
-//! on, or ⌘ held while it is off, hovering the canvas outlines the layer (or group, per the
-//! Auto-Select target) that a click there would pick. The hit test is the click's own
+//! on, or ⌘ held, hovering the canvas outlines the layer a click there would pick. ⌘ outlines
+//! the layer inside the group (click-through); otherwise the outline follows Auto-Select's
+//! Group or Layer target. The hit test is the click's own
 //! (`pick_cmds::auto_select_target`), so a type layer is outlined anywhere inside its text, as it
 //! is picked there (#2591). The answer is cached per document revision and pointer pixel: a
 //! pointer resting on the canvas costs nothing per frame.
@@ -24,9 +25,9 @@ pub(crate) struct Hover {
 }
 
 /// The document-space bounds to outline with the pointer at `at` (document px), or `None` when
-/// nothing is highlighted: the preference is off, another tool is current, a click wouldn't
-/// Auto-Select (it's off without ⌘, or the selected pixels move instead), a button is down, or a
-/// drag or transform is under way.
+/// nothing is highlighted: the preference is off, another tool is current, Auto-Select is off
+/// and ⌘ is not held (the selected pixels move instead), a button is down, or a drag or
+/// transform is under way.
 pub(crate) fn target(app: &mut PhotocraftApp, at: Option<[f64; 2]>, command: bool, pressed: bool) -> Option<Rect> {
     if !app.session.prefs().tools.show_highlight_on_rollover
         || app.ui.tool != Tool::Move
@@ -34,7 +35,7 @@ pub(crate) fn target(app: &mut PhotocraftApp, at: Option<[f64; 2]>, command: boo
         || app.drag.is_some()
         || app.guide_drag.is_some()
         || app.ui.transform.is_some()
-        || app.ui.tool_options.move_auto_select == command
+        || (!command && !app.ui.tool_options.move_auto_select)
         || crate::move_ui::moves_selected_pixels_with(app, Tool::Move)
     {
         app.canvas_hover_layer = None;
@@ -45,7 +46,8 @@ pub(crate) fn target(app: &mut PhotocraftApp, at: Option<[f64; 2]>, command: boo
         return None;
     };
     let at = [at[0].floor() as i32, at[1].floor() as i32];
-    let group = app.ui.tool_options.move_target == "group";
+    // ⌘/Ctrl outlines the layer a click-through would pick, not its group.
+    let group = !command && app.ui.tool_options.move_target == "group";
     let st = app.session.active()?;
     let (doc, revision) = (st.doc.id, st.revision);
     if let Some(h) = app.move_hover.as_ref().filter(|h| h.doc == doc && h.revision == revision && h.at == at && h.group == group) {
@@ -88,6 +90,29 @@ fn bounds(doc: &Document, l: &Layer) -> Rect {
     }
 }
 
+/// Double-click with the Move tool: step one level down the group that contains the point.
+/// A click has just selected the outermost group; [`PhotocraftApp::drill_older`] is the layer
+/// selected before the previous click, so a second double-click continues from there.
+pub(crate) fn descend_at(app: &mut PhotocraftApp, x: f64, y: f64) {
+    let Some(st) = app.session.active() else { return };
+    let doc = st.doc.clone();
+    let Some(leaf) = photocraft_engine::pick_cmds::auto_select_target(&doc, x.floor() as i32, y.floor() as i32, false) else { return };
+    let Some(path) = doc.path_of(leaf) else { return };
+    let chain: Vec<LayerId> = (1..=path.len()).filter_map(|n| doc.layer_at(&path[..n]).map(|l| l.id)).collect();
+    let on_chain = |id: LayerId| chain.contains(&id);
+    let from = app.drill_older.filter(|id| on_chain(*id));
+    // One level past the layer selected before the previous click. At the deepest layer, the
+    // click just reset the selection to the group, so put that layer back.
+    let next = if let Some(id) = from {
+        chain.iter().position(|c| *c == id).and_then(|i| chain.get(i + 1).copied()).or(Some(id))
+    } else {
+        chain.get(1).copied()
+    };
+    if let Some(id) = next {
+        let _ = app.run("layer.select", serde_json::json!({"layer": id.0}));
+    }
+}
+
 /// The document-space bounds to outline: either a layer hovered in the Layers panel, or what a
 /// click at `at` would pick with the Move tool.
 pub(crate) fn active_outline(app: &mut PhotocraftApp, at: Option<[f64; 2]>, command: bool, pressed: bool) -> Option<Rect> {
@@ -105,6 +130,43 @@ pub(crate) fn active_outline(app: &mut PhotocraftApp, at: Option<[f64; 2]>, comm
         return outline(&st.doc, id);
     }
     target(app, at, command, pressed)
+}
+
+/// Document-space bounds of the selected layers, each framed on the canvas. An artboard is not
+/// included: its frame is the board outline, and only when that artboard layer is selected.
+/// The Background fills the canvas, so it has no box either.
+pub(crate) fn selected_bounds(app: &PhotocraftApp) -> Vec<Rect> {
+    let Some(st) = app.session.active() else { return Vec::new() };
+    // Show Transform Controls already frames the active layer with handles.
+    let controls = app.ui.tool == Tool::Move && app.ui.tool_options.move_show_transform && app.ui.transform.is_none() && app.drag.is_none();
+    let mut out = Vec::new();
+    for id in st.selected_layers() {
+        if controls && st.active_layer == Some(id) {
+            continue;
+        }
+        let Some(layer) = st.doc.layer(id) else { continue };
+        if layer.artboard().is_some() || crate::doc_props_ui::is_background(&st.doc, layer) {
+            continue;
+        }
+        let b = photocraft_engine::transform_cmds::transform_bounds(&st.doc, layer);
+        if b.is_empty() {
+            continue;
+        }
+        let (dx, dy) = crate::move_ui::shown_offset(app, st.doc.id, st.revision, id).unwrap_or((0, 0));
+        out.push(b.translate(dx, dy));
+    }
+    out
+}
+
+/// The selected layers' boxes, in the theme's accent colour.
+pub(crate) fn draw_selection(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, idx: usize) {
+    if app.session.active_index() != Some(idx) || app.ui.transform.is_some() {
+        return;
+    }
+    let accent = crate::theme::Tokens::get(painter.ctx()).accent;
+    for b in selected_bounds(app) {
+        painter.rect_stroke(xf.doc_rect(b), 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+    }
 }
 
 /// Draws the highlight on the active document's canvas, in the theme's accent colour.

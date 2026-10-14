@@ -2,8 +2,8 @@
 //! View › Fit Artboard on Screen, and the Properties panel section (X/Y/W/H, preset,
 //! background). Everything that changes the document is `layer.artboard.set` and friends.
 
-use egui::{Align2, Color32, Pos2, Rect, Stroke};
-use photocraft_doc::{ArtboardBackground, Document, Layer};
+use egui::{Align2, Color32, Pos2, Rect, Stroke, vec2};
+use photocraft_doc::{ArtboardBackground, Document, Layer, LayerId};
 use serde_json::{Value, json};
 
 use crate::PhotocraftApp;
@@ -40,17 +40,45 @@ pub fn pasteboard_rects(xf: &ViewXform, doc: &Document) -> Vec<Rect> {
     out
 }
 
+/// Gap between the name's baseline and the top of the board, in screen points.
+const NAME_GAP: f32 = 4.0;
+const NAME_FONT: f32 = 11.0;
+
+/// Screen rect of an artboard name: the glyphs, plus the gap down to the board so the label
+/// and the frame are one continuous hover target.
+pub fn name_rect(ctx: &egui::Context, board: Rect, name: &str) -> Rect {
+    let galley = ctx.fonts_mut(|f| f.layout_no_wrap(name.to_owned(), egui::FontId::proportional(NAME_FONT), Color32::PLACEHOLDER));
+    let size = galley.size();
+    Rect::from_min_size(Pos2::new(board.left() - 2.0, board.top() - NAME_GAP - size.y), vec2(size.x + 4.0, size.y + NAME_GAP))
+}
+
+/// The topmost artboard whose name label contains screen point `p`.
+pub fn name_at(app: &PhotocraftApp, ctx: &egui::Context, xf: &ViewXform, p: Pos2) -> Option<LayerId> {
+    let st = app.session.active()?;
+    st.doc.artboards().iter().rev().find(|(_, name, a)| !name.is_empty() && name_rect(ctx, xf.doc_rect(a.rect), name).contains(p)).map(|b| b.0)
+}
+
+/// A click on an artboard name selects that artboard. True when `p` was on a name.
+pub fn select_name(app: &mut PhotocraftApp, ctx: &egui::Context, xf: &ViewXform, p: Pos2, shift: bool) -> bool {
+    let Some(id) = name_at(app, ctx, xf, p) else { return false };
+    let mode = if shift { "add" } else { "replace" };
+    let _ = app.run("layer.select", json!({"layer": id.0, "mode": mode}));
+    true
+}
+
 /// Board outlines and names (the active board's name is highlighted, as in Photoshop).
 pub fn draw_frames(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     let Some(st) = app.session.active() else { return };
     let t = Tokens::get(painter.ctx());
-    let active = st.active_layer.and_then(|id| st.doc.artboard_of(id));
+    // The board's own frame is the selection only when the artboard layer is selected. A layer
+    // on the board draws its own box (`move_hover::draw_selection`).
+    let selected = st.selected_layers();
     for (id, name, a) in st.doc.artboards() {
         let r = xf.doc_rect(a.rect);
-        let on = active == Some(id);
+        let on = selected.contains(&id);
         painter.rect_stroke(r, 0.0, Stroke::new(1.0, if on { t.accent } else { Color32::from_black_alpha(90) }), egui::StrokeKind::Outside);
-        let pos = Pos2::new(r.left(), r.top() - 4.0);
-        painter.text(pos, Align2::LEFT_BOTTOM, name, egui::FontId::proportional(11.0), if on { t.text } else { t.text_dim });
+        let pos = Pos2::new(r.left(), r.top() - NAME_GAP);
+        painter.text(pos, Align2::LEFT_BOTTOM, name, egui::FontId::proportional(NAME_FONT), if on { t.text } else { t.text_dim });
     }
 }
 
@@ -258,6 +286,60 @@ mod tests {
 
     fn boards(app: &PhotocraftApp) -> Vec<photocraft_geom::Rect> {
         app.session.active().unwrap().doc.artboards().iter().map(|b| b.2.rect).collect()
+    }
+
+    /// The name is drawn above the board, outside its rect, and a click there selects the board.
+    #[test]
+    fn clicking_the_name_selects_the_artboard() {
+        let (mut app, _) = app();
+        let id = app.run("layer.new.artboard", json!({"rect": [20, 40, 80, 50], "name": "Header"})).unwrap()["layer"].as_u64().unwrap();
+        let bg = app.session.active().unwrap().doc.layers[0].id.0;
+        app.run("layer.select", json!({"layer": bg})).unwrap();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        let xf = ViewXform {
+            rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0)),
+            zoom: 1.0,
+            center: [100.0, 100.0],
+            flip: false,
+            rotation: 0.0,
+            aspect: 1.0,
+        };
+        let board = xf.doc_rect(photocraft_geom::Rect::new(20, 40, 100, 90));
+        let label = name_rect(&ctx, board, "Header");
+        assert!(label.width() > 8.0, "the name has a hover width");
+        assert!(label.bottom() <= board.top() + 0.5 && label.top() < board.top(), "the name sits on top of the board");
+        assert_eq!(name_at(&app, &ctx, &xf, label.center()).map(|l| l.0), Some(id));
+        assert!(name_at(&app, &ctx, &xf, board.center()).is_none(), "the board interior is not the name");
+        assert!(select_name(&mut app, &ctx, &xf, label.center(), false));
+        assert_eq!(app.session.active().unwrap().active_layer.map(|l| l.0), Some(id));
+    }
+
+    /// A click on the board's empty area clears the layer selection. A drag there still moves
+    /// the board.
+    #[test]
+    fn a_click_on_an_empty_artboard_clears_the_selection() {
+        let (mut app, _) = app();
+        app.run("layer.new.artboard", json!({"rect": [0, 0, 40, 40]})).unwrap();
+        app.run("layer.new.layer", json!({})).unwrap();
+        app.session
+            .edit("paint", |doc, a| {
+                doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(4, 4, 12, 12), &[1.0, 0.0, 0.0, 1.0]);
+                Ok(())
+            })
+            .unwrap();
+        let paint = app.session.active().unwrap().active_layer.unwrap();
+        app.ui.tool = crate::state::Tool::Move;
+        // Handles replace the plain selection box; this checks the layer's own frame.
+        app.ui.tool_options.move_show_transform = false;
+        app.ui.extras.snap = false;
+        app.ui.view.show.smart_guides = false;
+        drag(&mut app, [24.0, 24.0], [0.0, 0.0], egui::Modifiers::NONE);
+        assert!(app.session.active().unwrap().active_layer.is_none());
+        drag(&mut app, [8.0, 8.0], [0.0, 0.0], egui::Modifiers::NONE);
+        assert_eq!(app.session.active().unwrap().active_layer, Some(paint));
+        assert_eq!(crate::move_hover::selected_bounds(&app), vec![photocraft_geom::Rect::new(4, 4, 12, 12)]);
     }
 
     /// #1531: the Move tool drags a board by an empty spot on it (Auto-Select picks the board, not

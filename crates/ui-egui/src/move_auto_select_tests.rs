@@ -1,6 +1,6 @@
-//! Move tool Auto-Select (#296), as in Photoshop: on by default, a press picks the topmost
-//! visible layer with pixels under the pointer (or its outermost group in Group mode) and the drag
-//! then moves it; ⌘/Ctrl held at the press inverts the option for that click.
+//! Move tool Auto-Select (#296): on by default, a press picks the topmost visible layer with
+//! pixels under the pointer (or its outermost group in Group mode) and the drag then moves it.
+//! ⌘/Ctrl-click selects the layer inside the group, through it.
 
 use photocraft_doc::LayerId;
 use photocraft_geom::Rect;
@@ -73,12 +73,36 @@ fn a_press_picks_the_layer_under_the_pointer_and_drags_it() {
 }
 
 #[test]
-fn command_click_suspends_auto_select_for_that_drag() {
+fn command_click_selects_the_layer_inside_the_group() {
     let (mut app, a, b) = app();
-    drag(&mut app, [16.0, 16.0], [-10.0, 0.0], egui::Modifiers::COMMAND);
-    assert_eq!(active(&app), Some(b), "⌘ held: no pick");
-    assert_eq!(bounds(&app, b), Rect::new(30, 40, 46, 56), "the selected layer moved");
-    assert_eq!(bounds(&app, a), Rect::new(8, 8, 24, 24));
+    app.session.execute("layer.select", json!({"layer": a.0})).unwrap();
+    let group = LayerId(app.session.execute("layer.new.groupFromLayers", json!({"name": "G"})).unwrap()["layer"].as_u64().unwrap());
+    app.session.execute("layer.select", json!({"layer": b.0})).unwrap();
+    drag(&mut app, [16.0, 16.0], [0.0, 0.0], egui::Modifiers::NONE);
+    assert_eq!(active(&app), Some(group), "a click selects the group");
+    drag(&mut app, [16.0, 16.0], [4.0, 0.0], egui::Modifiers::COMMAND);
+    assert_eq!(active(&app), Some(a), "⌘-click selects the layer inside");
+    assert_eq!(bounds(&app, a), Rect::new(12, 8, 28, 24), "and the drag moves that layer");
+    assert_eq!(bounds(&app, b), Rect::new(40, 40, 56, 56));
+}
+
+#[test]
+fn a_second_double_click_steps_one_level_deeper() {
+    let (mut app, a, _b) = app();
+    app.session.execute("layer.select", json!({"layer": a.0})).unwrap();
+    let inner = LayerId(app.session.execute("layer.new.groupFromLayers", json!({"name": "Inner"})).unwrap()["layer"].as_u64().unwrap());
+    app.session.execute("layer.select", json!({"layer": inner.0})).unwrap();
+    let _outer = LayerId(app.session.execute("layer.new.groupFromLayers", json!({"name": "Outer"})).unwrap()["layer"].as_u64().unwrap());
+    // Each double-click is two presses. The canvas calls descend on the second one.
+    let click = |app: &mut PhotocraftApp| drag(app, [16.0, 16.0], [0.0, 0.0], egui::Modifiers::NONE);
+    click(&mut app);
+    click(&mut app);
+    crate::move_hover::descend_at(&mut app, 16.0, 16.0);
+    assert_eq!(active(&app), Some(inner), "the first double-click enters one level");
+    click(&mut app);
+    click(&mut app);
+    crate::move_hover::descend_at(&mut app, 16.0, 16.0);
+    assert_eq!(active(&app), Some(a), "the next one reaches the layer");
 }
 
 #[test]
@@ -114,6 +138,17 @@ fn dragging_one_of_several_selected_layers_moves_them_all() {
     drag(&mut app, [16.0, 16.0], [-4.0, -4.0], egui::Modifiers::NONE);
     assert_eq!(bounds(&app, a), Rect::new(4, 4, 20, 20));
     assert_eq!(bounds(&app, b), Rect::new(36, 36, 52, 52));
+}
+
+#[test]
+fn a_click_beside_a_layer_clears_the_selection() {
+    let (mut app, a, _b) = app();
+    drag(&mut app, [2.0, 2.0], [0.0, 0.0], egui::Modifiers::NONE);
+    let st = app.session.active().unwrap();
+    assert!(st.active_layer.is_none(), "empty canvas clears the selection");
+    assert!(st.selected_layers().is_empty());
+    drag(&mut app, [16.0, 16.0], [0.0, 0.0], egui::Modifiers::NONE);
+    assert_eq!(active(&app), Some(a), "a click on a layer still selects it");
 }
 
 #[test]

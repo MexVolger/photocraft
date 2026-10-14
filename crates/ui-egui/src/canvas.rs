@@ -3122,7 +3122,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     if !under_dialog && ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))) {
         crate::spring_tools::note_canvas_press(app);
     }
-    // Navigation (wheel_nav.rs): scroll pans (⇧ or ⌘/Ctrl sideways); pinch and ⌥-scroll zoom around the pointer.
+    // Navigation (wheel_nav.rs): the wheel pans (⇧ sideways); pinch, ⌘/Ctrl and ⌥ zoom around the pointer.
     let wheel =
         crate::wheel_nav::read(&ctx, app.session.prefs().general.zoom_with_scroll_wheel, app.session.prefs().enhanced_controls.zoom_with_trackpad_pinch);
     // The wheel also scrolls over the scrollbars drawn on top of the canvas (last frame's hover).
@@ -3443,12 +3443,19 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         if buttons.started
             && let Some(p) = ui.input(|i| i.pointer.press_origin()).filter(|p| rect.contains(*p)).or(response.interact_pointer_pos())
         {
-            if tool == Tool::Move && app.ui.transform.is_none() {
-                begin_transform_controls_at(app, &ctx, &xf, p);
+            // The name sits above the board, outside its rect. A press there selects the artboard
+            // instead of starting a move or a new board.
+            let on_name = matches!(tool, Tool::Move | Tool::Artboard)
+                && app.ui.transform.is_none()
+                && crate::artboard_ui::select_name(app, &ctx, &xf, p, mods.shift);
+            if !on_name {
+                if tool == Tool::Move && app.ui.transform.is_none() {
+                    begin_transform_controls_at(app, &ctx, &xf, p);
+                }
+                let d = xf.to_doc(p);
+                let press_mods = if capture_press { ctx.data(|d| d.get_temp(tool_press)).unwrap_or(mods) } else { mods };
+                tool_event(app, ToolEvent::Down { x: d[0], y: d[1], pressure: app.stylus.pressure() }, press_mods);
             }
-            let d = xf.to_doc(p);
-            let press_mods = if capture_press { ctx.data(|d| d.get_temp(tool_press)).unwrap_or(mods) } else { mods };
-            tool_event(app, ToolEvent::Down { x: d[0], y: d[1], pressure: app.stylus.pressure() }, press_mods);
         }
         // A stroke started on the press takes its moves from the press on, not only once egui
         // recognises a drag (past its click distance): otherwise the first few points are lost
@@ -3561,14 +3568,21 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                 // The first click placed (or grabbed) the point; the second toggles it.
                 Tool::CurvaturePen if response.double_clicked() => crate::vector_ui::curvature_toggle(app, d[0], d[1]),
                 _ => {
-                    if tool == Tool::Move && app.ui.transform.is_none() {
-                        begin_transform_controls_at(app, &ctx, &xf, p);
+                    // A click (no drag) on the name selects the artboard. The release must not
+                    // then clear the selection: the label is outside the board.
+                    let on_name = matches!(tool, Tool::Move | Tool::Artboard)
+                        && app.ui.transform.is_none()
+                        && crate::artboard_ui::select_name(app, &ctx, &xf, p, click_mods.shift);
+                    if !on_name {
+                        if tool == Tool::Move && app.ui.transform.is_none() {
+                            begin_transform_controls_at(app, &ctx, &xf, p);
+                        }
+                        // If this tool was not handled on pointer-down, fall back to a
+                        // click-sized gesture while preserving pen pressure (mouse stays at 1).
+                        tool_event(app, ToolEvent::Down { x: d[0], y: d[1], pressure: app.stylus.pressure() }, click_mods);
+                        tap_at_peak_pressure(app);
+                        tool_event(app, ToolEvent::Up { x: d[0], y: d[1] }, click_mods);
                     }
-                    // If this tool was not handled on pointer-down, fall back to a
-                    // click-sized gesture while preserving pen pressure (mouse stays at 1).
-                    tool_event(app, ToolEvent::Down { x: d[0], y: d[1], pressure: app.stylus.pressure() }, click_mods);
-                    tap_at_peak_pressure(app);
-                    tool_event(app, ToolEvent::Up { x: d[0], y: d[1] }, click_mods);
                 }
             }
         }
@@ -3593,7 +3607,12 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             && let Some(p) = response.interact_pointer_pos()
         {
             let d = xf.to_doc(p);
-            crate::type_tool::edit_at(app, d[0], d[1]);
+            // Type still opens for editing. Otherwise a double-click steps one group deeper,
+            // and ⌘-double-click keeps the layer the ⌘-click already selected. The artboard
+            // name selects the board; it does not drill into a layer above it.
+            if crate::artboard_ui::name_at(app, &ctx, &xf, p).is_none() && !crate::type_tool::edit_at(app, d[0], d[1]) && !mods.command {
+                crate::move_hover::descend_at(app, d[0], d[1]);
+            }
         }
         if app.ui.transform.is_some() && response.double_clicked() {
             crate::transform_tool::commit(app);
@@ -3657,6 +3676,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         let resizing = crate::brush_resize::draw(app, &painter, &xf);
         draw_transform_controls(app, &painter, &xf);
         crate::move_hover::draw(app, &painter, &xf, idx, response.hover_pos());
+        crate::move_hover::draw_selection(app, &painter, &xf, idx);
         crate::object_finder::draw(app, &painter, &xf, idx, response.hover_pos());
         crate::layer_pick_ui::show(app, &ctx);
         let shown = app.ui.views.get(idx).cloned();
@@ -3699,6 +3719,17 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         });
         if let Some((vertical, _)) = guide_hover {
             ui.ctx().set_cursor_icon(if vertical { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
+        } else if let Some(p) = response.hover_pos().filter(|_| matches!(tool, Tool::Move | Tool::Artboard) && app.ui.transform.is_none())
+            && let Some(id) = crate::artboard_ui::name_at(app, &ctx, &xf, p)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            let selected = app.session.active().is_some_and(|st| st.selected_layers().contains(&id));
+            if !selected
+                && let Some(board) = app.session.active().and_then(|st| st.doc.layer(id).and_then(|l| l.artboard()).map(|a| a.rect))
+            {
+                let accent = crate::theme::Tokens::get(&ctx).accent;
+                painter.rect_stroke(xf.doc_rect(board), 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+            }
         } else if let Some(p) = response.hover_pos()
             && let Some(c) = crate::transform_tool::cursor(app, xf.to_doc(p), ui.input(|i| i.modifiers.alt || i.modifiers.command))
         {
@@ -4493,7 +4524,8 @@ pub(crate) fn layer_edges_rect(app: &PhotocraftApp, idx: usize) -> Option<photoc
     Some(b.translate(dx, dy))
 }
 
-/// Move tool › Show Transform Controls: the active layer's transform bounds.
+/// Move tool: the active layer's transform bounds. Handles show as soon as a layer is
+/// selected; the options-bar checkbox turns them off.
 fn transform_controls_rect(app: &PhotocraftApp, xf: &ViewXform) -> Option<Rect> {
     if app.ui.tool != Tool::Move || !app.ui.tool_options.move_show_transform || app.ui.transform.is_some() || app.drag.is_some() {
         return None;
@@ -4515,11 +4547,16 @@ fn transform_controls_rect(app: &PhotocraftApp, xf: &ViewXform) -> Option<Rect> 
 /// The Move tool shows transform handles even before a Free Transform session exists.
 /// Use the same hit areas for pointer-down and hover, so a control never behaves like
 /// resize/rotate while showing the ordinary four-arrow Move cursor (#2871).
+///
+/// A layer that is small on screen would have those handles covering it, and the edge
+/// handles would sit in its middle. Figma hides the handles in that case so a drag moves
+/// the layer. The same rule applies here: no handle or rotation band unless both sides
+/// leave a gap inside the grab radius, and an edge handle only when its side is long
+/// enough not to land on the corners.
 fn transform_controls_cursor(r: Rect, p: Pos2) -> Option<egui::CursorIcon> {
-    let handles = [r.left_top(), r.center_top(), r.right_top(), r.right_center(), r.right_bottom(), r.center_bottom(), r.left_bottom(), r.left_center()];
     let grab = crate::transform_tool::HANDLE_PX as f32;
-    for (i, handle) in handles.into_iter().enumerate() {
-        if handle.distance(p) <= grab {
+    for (i, handle) in transform_handle_points(r).into_iter().enumerate() {
+        if transform_handle_active(r, i) && handle.distance(p) <= grab {
             return Some(match i {
                 0 | 4 => egui::CursorIcon::ResizeNwSe,
                 2 | 6 => egui::CursorIcon::ResizeNeSw,
@@ -4532,8 +4569,32 @@ fn transform_controls_cursor(r: Rect, p: Pos2) -> Option<egui::CursorIcon> {
     in_rotation_band(r, p).then_some(egui::CursorIcon::None)
 }
 
+/// Both sides longer than the handle grab, so a drag in the middle still moves the layer.
+fn transform_controls_fit(r: Rect) -> bool {
+    let room = crate::transform_tool::HANDLE_PX as f32 * 2.0;
+    r.width().abs() > room && r.height().abs() > room
+}
+
+/// Corner handles are 0, 2, 4, 6. Edge handles (1, 3, 5, 7) need a longer side so they
+/// don't collapse into the centre.
+fn transform_handle_active(r: Rect, index: usize) -> bool {
+    if !transform_controls_fit(r) {
+        return false;
+    }
+    let edge = crate::transform_tool::HANDLE_PX as f32 * 3.0;
+    match index {
+        1 | 5 => r.width().abs() > edge,
+        3 | 7 => r.height().abs() > edge,
+        _ => true,
+    }
+}
+
+fn transform_handle_points(r: Rect) -> [Pos2; 8] {
+    [r.left_top(), r.center_top(), r.right_top(), r.right_center(), r.right_bottom(), r.center_bottom(), r.left_bottom(), r.left_center()]
+}
+
 fn in_rotation_band(r: Rect, p: Pos2) -> bool {
-    r.expand(18.0).contains(p) && !r.expand(5.0).contains(p)
+    transform_controls_fit(r) && r.expand(18.0).contains(p) && !r.expand(5.0).contains(p)
 }
 
 /// In the rotation band just outside the Move tool's transform controls, the screen direction the
@@ -4542,9 +4603,7 @@ fn in_rotation_band(r: Rect, p: Pos2) -> bool {
 /// drag there rotates.
 fn transform_controls_turn(r: Rect, p: Pos2) -> Option<Vec2> {
     if !in_rotation_band(r, p)
-        || [r.left_top(), r.center_top(), r.right_top(), r.right_center(), r.right_bottom(), r.center_bottom(), r.left_bottom(), r.left_center()]
-            .into_iter()
-            .any(|h| h.distance(p) <= crate::transform_tool::HANDLE_PX as f32)
+        || transform_handle_points(r).into_iter().enumerate().any(|(i, h)| transform_handle_active(r, i) && h.distance(p) <= crate::transform_tool::HANDLE_PX as f32)
     {
         return None;
     }
@@ -4578,7 +4637,10 @@ fn draw_transform_controls(app: &mut PhotocraftApp, painter: &egui::Painter, xf:
     let Some(r) = transform_controls_rect(app, xf) else { return };
     let accent = crate::theme::Tokens::get(painter.ctx()).accent;
     painter.rect_stroke(r, 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Middle);
-    for p in [r.left_top(), r.center_top(), r.right_top(), r.right_center(), r.right_bottom(), r.center_bottom(), r.left_bottom(), r.left_center()] {
+    for (i, p) in transform_handle_points(r).into_iter().enumerate() {
+        if !transform_handle_active(r, i) {
+            continue;
+        }
         let h = Rect::from_center_size(p, vec2(7.0, 7.0));
         painter.rect_filled(h, 0.0, Color32::WHITE);
         painter.rect_stroke(h, 0.0, Stroke::new(1.0, accent), egui::StrokeKind::Inside);
@@ -4992,10 +5054,15 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 app.guide_drag = Some(crate::rulers::GuideDrag { vertical, index: Some(i), pos: if vertical { x } else { y } });
                 return;
             }
-            // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first
-            // (not when the selected pixels move: those are the active layer's).
-            if !crate::move_ui::moves_selected_pixels_with(app, tool) && app.ui.tool_options.move_auto_select != mods.command {
-                let target = app.ui.tool_options.move_target.clone();
+            // A click selects the outermost group (Auto-Select: Group). ⌘/Ctrl-click selects the
+            // layer under the pointer, through that group, as in Figma. Auto-Select off keeps the
+            // current layer unless ⌘ is held.
+            let deep = mods.command;
+            if !crate::move_ui::moves_selected_pixels_with(app, tool) && (deep || app.ui.tool_options.move_auto_select) {
+                let current = app.session.active().and_then(|st| st.active_layer);
+                app.drill_older = app.drill_before;
+                app.drill_before = current;
+                let target = if deep { "layer".to_string() } else { app.ui.tool_options.move_target.clone() };
                 let mode = if mods.shift { "add" } else { "replace" };
                 let before = app.session.active().map(|st| st.selected_layers());
                 // A locked layer under the pointer (the Background) can't move. Photoshop draws
@@ -5015,14 +5082,14 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                         // marquee then replaces that selection on release.
                         let _ = app.run("layer.pickAt", json!({"x": x, "y": y, "target": target, "mode": mode}));
                     }
-                    crate::move_box::begin(app, [x, y], mods.shift);
+                    crate::move_box::begin(app, [x, y], mods.shift, deep);
                     return;
                 }
                 let picked = app.run("layer.pickAt", json!({"x": x, "y": y, "target": target, "mode": mode}));
                 // No pixels there at all (an empty spot, or off the canvas): drag a marquee that
                 // selects the layers it touches instead (move_box.rs).
                 if picked.is_ok_and(|v| v["layer"].is_null()) && crate::move_box::empty_at(app, [x, y]) {
-                    crate::move_box::begin(app, [x, y], mods.shift);
+                    crate::move_box::begin(app, [x, y], mods.shift, deep);
                     return;
                 }
                 // Snapping (and the drag's box) started before the pick: point it at what moves.
@@ -5246,6 +5313,10 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 crate::move_mods::finish(app);
                 if d.sel_move.is_some() {
                     finish_selection_drag(app, true, d.start, d.start);
+                } else if !d.modifiers.shift && !crate::move_box::element_under(app, d.start) {
+                    // Beside every element, including an artboard's empty area: clear the
+                    // selection. The press may have targeted the artboard; a click does not keep it.
+                    let _ = app.run("select.deselectLayers", json!({}));
                 }
                 return;
             }
@@ -7620,6 +7691,21 @@ mod transform_controls_tests {
     use serde_json::json;
 
     #[test]
+    fn selecting_a_layer_shows_its_resize_handles() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.execute("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.session.execute("shape.create", json!({"kind": "rect", "rect": [20, 30, 80, 40], "fill": "#ff0000"})).unwrap();
+        app.sync_views();
+        app.ui.tool = Tool::Move;
+        let xf =
+            ViewXform { rect: Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0)), zoom: 1.0, center: [100.0, 100.0], flip: false, rotation: 0.0, aspect: 1.0 };
+        let r = transform_controls_rect(&app, &xf).expect("a selected layer shows handles without an extra toggle");
+        assert!(transform_controls_hit(r, r.right_bottom()));
+        app.ui.tool_options.move_show_transform = false;
+        assert!(transform_controls_rect(&app, &xf).is_none(), "the options-bar checkbox still hides them");
+    }
+
+    #[test]
     fn move_transform_controls_start_free_transform_for_vector_shapes() {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.session.execute("file.new", json!({"width": 200, "height": 200})).unwrap();
@@ -7745,6 +7831,22 @@ mod transform_controls_tests {
         assert_ne!(r, next);
         assert_eq!(transform_controls_cursor(next, next.right_bottom()), Some(egui::CursorIcon::ResizeNwSe));
         assert_eq!(transform_controls_cursor(next, next.center()), None);
+    }
+
+    /// Zoomed out, a small layer's handles would cover it and the edge handles would sit in
+    /// its middle. Those targets drop out, so a drag moves the layer (as in Figma).
+    #[test]
+    fn a_small_selection_moves_instead_of_resizing() {
+        let tiny = Rect::from_min_max(pos2(40.0, 40.0), pos2(48.0, 48.0));
+        assert!(!transform_controls_fit(tiny));
+        for p in [tiny.center(), tiny.left_top(), tiny.center_top(), pos2(tiny.center().x, tiny.top() - 12.0)] {
+            assert_eq!(transform_controls_cursor(tiny, p), None, "no resize or rotate at {p:?}");
+            assert!(!transform_controls_hit(tiny, p));
+        }
+        // A long thin layer: the middle is a move, not the edge handle that would sit there.
+        let thin = Rect::from_min_max(pos2(10.0, 50.0), pos2(160.0, 58.0));
+        assert_eq!(transform_controls_cursor(thin, thin.center()), None);
+        assert!(!transform_controls_hit(thin, thin.center_top()));
     }
 
     #[test]

@@ -174,6 +174,11 @@ pub fn abandon(app: &mut PhotocraftApp) {
 pub fn arrow_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     use egui::{Key, Modifiers};
     let cmd = ctx.input(|i| i.modifiers.command) && crate::hold_keys::cmd_nudges(app);
+    // The Hand tool pans the view. With nothing to nudge, the arrows move the camera, and ⇧
+    // moves it farther, as on Figma's canvas.
+    if app.ui.tool == Tool::Hand && app.ui.transform.is_none() && !cmd {
+        return hand_pan_arrows(app, ctx);
+    }
     if app.ui.tool != Tool::Move && app.ui.transform.is_none() && !cmd {
         return selection_arrow_keys(app, ctx) || crate::direct_select::arrow_keys(app, ctx) || brush_arrow_keys(app, ctx);
     }
@@ -186,6 +191,27 @@ pub fn arrow_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
             if ctx.input_mut(|i| i.consume_key(base | mods, key)) {
                 let k = if mods.shift { 10.0 } else { 1.0 };
                 nudge(app, ux * k, uy * k, mods.alt);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Arrow keys with the Hand tool: pan the view by a fixed screen step (⇧ five times that).
+fn hand_pan_arrows(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
+    use egui::{Key, Modifiers};
+    let keys = [(Key::ArrowLeft, -1.0, 0.0), (Key::ArrowRight, 1.0, 0.0), (Key::ArrowUp, 0.0, -1.0), (Key::ArrowDown, 0.0, 1.0)];
+    for (key, sx, sy) in keys {
+        for (mods, k) in [(Modifiers::SHIFT, 5.0), (Modifiers::NONE, 1.0)] {
+            if ctx.input_mut(|i| i.consume_key(mods, key)) {
+                let Some(i) = app.session.active_index() else { return true };
+                let ppp = app.canvas_ppp();
+                let view = &mut app.ui.views[i];
+                let step = 48.0 * k * ppp / view.zoom.max(0.01);
+                view.center[0] += sx * step;
+                view.center[1] += sy * step;
+                view.fit_pending = false;
                 return true;
             }
         }
@@ -428,8 +454,8 @@ mod tests {
         arrow_keys(app, &ctx)
     }
 
-    /// Photoshop's ← / → with a painting tool turn the brush tip 1°, ⇧ 15°; → is clockwise. Other
-    /// tools keep their arrows (the Hand has none, the marquee nudges the selection).
+    /// Photoshop's ← / → with a painting tool turn the brush tip 1°, ⇧ 15°; → is clockwise. The
+    /// Hand pans the view instead. The marquee nudges the selection.
     #[test]
     fn arrows_turn_the_brush_tip_for_painting_tools_only() {
         let mut app = app_with_layer();
@@ -445,7 +471,9 @@ mod tests {
         // ⌥-arrows are not the brush's (they kern type, and ⌘ moves).
         assert!(!press(&mut app, egui::Key::ArrowLeft, egui::Modifiers::ALT));
         app.ui.tool = Tool::Hand;
-        assert!(!press(&mut app, egui::Key::ArrowLeft, egui::Modifiers::NONE));
+        let before = app.ui.views[0].center;
+        assert!(press(&mut app, egui::Key::ArrowLeft, egui::Modifiers::NONE), "the Hand pans");
+        assert!(app.ui.views[0].center[0] < before[0], "← looks left: {before:?} -> {:?}", app.ui.views[0].center);
         assert_eq!(app.session.tools.brush.angle, 0.0);
     }
 

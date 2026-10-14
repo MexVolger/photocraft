@@ -519,6 +519,10 @@ pub struct PhotocraftApp {
     /// A Move-tool press landed on a locked layer: the first pointer move shows Photoshop's
     /// message (`move_lock`), a plain click shows nothing.
     pub(crate) move_blocked: bool,
+    /// Layer selected just before the previous Move-tool click, and before this one. A
+    /// double-click steps one group deeper from the older of the two (`move_hover::descend_at`).
+    pub(crate) drill_before: Option<photocraft_doc::LayerId>,
+    pub(crate) drill_older: Option<photocraft_doc::LayerId>,
     /// The tool pointer events go to this frame when it isn't the selected one: the Move tool
     /// while ⌘ is held (`hold_keys::cmd_moves`). Set by the canvas for its gestures, never saved.
     pub(crate) tool_override: Option<state::Tool>,
@@ -778,6 +782,8 @@ impl PhotocraftApp {
             checker: None,
             drag: None,
             move_blocked: false,
+            drill_before: None,
+            drill_older: None,
             tool_override: None,
             live_stroke: None,
             committed_stroke: None,
@@ -2208,7 +2214,7 @@ impl PhotocraftApp {
         // egui's own ⌘+ / ⌘- / ⌘0 scale the whole interface; PhotoCraft zooms the canvas instead
         // (shortcuts.rs), like Photoshop.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        // ⌘/Ctrl + wheel scrolls sideways, as in Photoshop; only a pinch zooms (wheel_nav.rs).
+        // ⇧ + wheel pans sideways. ⌘/Ctrl + wheel zooms the canvas (wheel_nav.rs).
         wheel_nav::configure(ctx);
     }
 }

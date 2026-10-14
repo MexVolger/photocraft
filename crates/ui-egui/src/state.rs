@@ -600,13 +600,13 @@ pub struct ToolOptions {
     #[serde(default = "one")]
     pub marquee_height: f32,
     /// Move tool: Auto-Select (with "layer" or "group" target) and Show Transform Controls.
-    /// Auto-Select is on with the "group" target by default, as in current Photoshop;
-    /// ⌘/Ctrl-click inverts it.
+    /// Auto-Select is on with the "group" target by default. Selecting a layer shows its
+    /// resize handles, as in Figma; the options-bar checkbox turns them off.
     #[serde(default = "yes")]
     pub move_auto_select: bool,
     #[serde(default = "default_move_target")]
     pub move_target: String,
-    #[serde(default)]
+    #[serde(default = "yes")]
     pub move_show_transform: bool,
     /// Crop options bar: aspect ratio ("" = Ratio/unconstrained, "w:h", or "original") and
     /// Delete Cropped Pixels.
@@ -810,7 +810,7 @@ impl Default for ToolOptions {
             marquee_height: 1.0,
             move_auto_select: true,
             move_target: default_move_target(),
-            move_show_transform: false,
+            move_show_transform: true,
             crop_ratio: String::new(),
             crop_custom_ratio_width: 0.0,
             crop_custom_ratio_height: 0.0,
